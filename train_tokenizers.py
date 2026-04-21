@@ -1,12 +1,17 @@
 import sentencepiece as spm
 import glob
 import os
+import sys
+import time
 import traceback
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from huggingface_hub import HfApi, CommitOperationAdd
 
 LOG_FILE = "tokenizer_errors.txt"
 SPM_DIR = "spm_tokenizers"
+HF_TOKEN_WRITE = os.environ["HF_TOKEN_WRITE_bilingual_tokenizers"]
+HF_REPO_ID = "catherinearnett/bilingual_tokenizers"
 
 
 def log_error(label, exc):
@@ -18,18 +23,57 @@ def log_error(label, exc):
         f.write(traceback.format_exc())
 
 
-def build_jobs():
+def get_hf_uploaded_files():
+    api = HfApi()
+    try:
+        files = api.list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN_WRITE)
+        return {os.path.basename(f) for f in files}
+    except Exception as e:
+        print(f"Warning: could not fetch HF file list: {e}")
+        return set()
+
+
+def upload_batch(tokenizer_names):
+    if not tokenizer_names:
+        return
+    api = HfApi()
+    operations = []
+    for name in tokenizer_names:
+        for ext in [".model", ".vocab"]:
+            local_path = os.path.join(SPM_DIR, f"{name}{ext}")
+            if os.path.exists(local_path):
+                operations.append(CommitOperationAdd(
+                    path_in_repo=f"spm_tokenizers/{name}{ext}",
+                    path_or_fileobj=local_path,
+                ))
+    if not operations:
+        return
+    try:
+        api.create_commit(
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            token=HF_TOKEN_WRITE,
+            commit_message=f"Add {len(tokenizer_names)} tokenizers",
+            operations=operations,
+        )
+        print(f"  ↑ Uploaded {tokenizer_names[0]} ({len(operations)} files)")
+    except Exception as e:
+        print(f"  ✗ Upload failed: {e}")
+        log_error("upload", e)
+
+
+def build_jobs(uploaded_files):
     jobs = []
     for input_file in glob.glob("mixed_data/*.txt"):
-        base = os.path.splitext(os.path.basename(input_file))[0]  # strip .txt
-        # Normalize: remove trailing _nfc or _500mb__nfc suffixes
+        base = os.path.splitext(os.path.basename(input_file))[0]
         stem = base.replace("_500mb", "").replace("_subset_1_nfc", "").strip("_")
-
         for model_type in ["unigram", "bpe"]:
             for split_by_whitespace in [True, False]:
                 pretok = "whitespace" if split_by_whitespace else "nowhitespace"
                 for vocab_size in [16384, 32768, 65536]:
                     tokenizer_name = f"{stem}_{model_type}_{pretok}_{vocab_size}"
+                    if f"{tokenizer_name}.model" in uploaded_files:
+                        continue
                     jobs.append((input_file, tokenizer_name, model_type, split_by_whitespace, vocab_size))
     return jobs
 
@@ -41,7 +85,7 @@ def run_job(args):
     spm_path = os.path.join(SPM_DIR, f"{tokenizer_name}.model")
 
     if os.path.exists(spm_path):
-        return "skipped", label
+        return "skipped", label, tokenizer_name
 
     try:
         spm.SentencePieceTrainer.train(
@@ -56,36 +100,49 @@ def run_job(args):
             normalization_rule_name="identity",
             split_by_whitespace=split_by_whitespace,
             byte_fallback=True,
-            num_threads=1,  # one thread per worker; parallelism comes from the pool
+            num_threads=1,
         )
-        return "trained", label
+        return "trained", label, tokenizer_name
     except Exception as e:
         log_error(label, e)
-        return "failed", label
+        return "failed", label, None
 
 
 if __name__ == "__main__":
     NUM_WORKERS = 4
 
-    os.makedirs(SPM_DIR, exist_ok=True)  # once, before workers start
+    os.makedirs(SPM_DIR, exist_ok=True)
 
-    with open(LOG_FILE, "w") as f:
-        f.write(f"Tokenizer error log — started {datetime.now().isoformat()}\n")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"\nTokenizer run — started {datetime.now().isoformat()}\n")
 
-    jobs = build_jobs()
+    print("Fetching already-uploaded files from HF...")
+    uploaded_files = get_hf_uploaded_files()
+    print(f"  {len(uploaded_files)} files already on HF, skipping those jobs.")
+
+    jobs = build_jobs(uploaded_files)
     total = len(jobs)
     print(f"Total jobs: {total} | Workers: {NUM_WORKERS}")
+
+    if total == 0:
+        print("All tokenizers already uploaded. Nothing to do.")
+        sys.exit(0)
 
     counts = {"trained": 0, "skipped": 0, "failed": 0}
 
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
         futures = {executor.submit(run_job, job): job for job in jobs}
         for future in as_completed(futures):
-            result, label = future.result()
+            result, label, tokenizer_name = future.result()
             counts[result] += 1
             t, s, f = counts["trained"], counts["skipped"], counts["failed"]
             print(f"[{result.upper()}] {label}")
             print(f"  Progress: {t + s + f}/{total}  (✓ {t}  ⏭ {s}  ✗ {f})")
 
+            if result in ("trained", "skipped") and tokenizer_name:
+                if f"{tokenizer_name}.model" not in uploaded_files:
+                    upload_batch([tokenizer_name])
+                    
     t, s, f = counts["trained"], counts["skipped"], counts["failed"]
     print(f"\nDone. Trained: {t}, Skipped: {s}, Failed: {f}. Errors logged to {LOG_FILE}")
+    sys.exit(0)
