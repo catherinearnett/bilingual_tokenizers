@@ -1,0 +1,25 @@
+# PyTorch (CUDA 12.1) — install separately with:
+# uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+torchaudio
+
+# Core NLP
+transformers
+datasets
+tokenizers
+sentencepiece
+protobuf
+
+# Tokenizer / language tools
+fasttext
+urielplus
+
+# Inference
+vllm
+ray
+
+# Utilities
+accelerate
+psutil
+numpy<2.0
