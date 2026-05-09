@@ -1,19 +1,18 @@
 """
 Calculate CTC (token count) for all HF tokenizers against FLORES+.
 
+Tokenizers are loaded directly from HuggingFace repos:
+  Bilingual   → catherinearnett/bilingual_tokenizers2
+  Monolingual → catherinearnett/monolingual_tokenizers
+
+Each tokenizer is a subdirectory containing tokenizer.json, loadable with:
+  AutoTokenizer.from_pretrained("{repo_id}/{stem}", token=...)
+
 Rules:
   Bilingual tokenizers  → CTC for lang1 and lang2 only
   Monolingual tokenizers → CTC for ALL available FLORES+ languages
 
-CTC = total non-special tokens across all sentences (dev + devtest) for a language.
-
-Filename convention (stem of .json in hf_tokenizers/):
-  Monolingual : {lang}_{tok_type}_{whitespace}_{vocab_size}          (5 parts)
-  Bilingual   : {lang1}_{lang2}_{p1}_{p2}_{tok_type}_{whitespace}_{vocab_size}  (9 parts)
-
-FLORES+ is loaded via HuggingFace datasets with your read token.
-Languages are loaded one at a time and cached to avoid re-downloading.
-If a language config is not in FLORES+, it is skipped with a warning.
+CTC = total non-special tokens across all sentences (dev + devtest).
 
 Output:
   ctc_results.csv — columns:
@@ -21,27 +20,33 @@ Output:
     vocab_size, flores_lang, ctc
 
 Usage:
+    export HF_TOKEN_READ=hf_...
     python calculate_ctc.py
-    python calculate_ctc.py --hf_dir hf_tokenizers --out ctc_results.csv --workers 4
+    python calculate_ctc.py --out ctc_results.csv --resume
 
 Requirements:
-    pip install transformers datasets pandas
+    pip install transformers datasets pandas huggingface_hub
 """
 
 import os
-import glob
+import sys
 import argparse
 import traceback
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from transformers import PreTrainedTokenizerFast
+from huggingface_hub import HfApi
+from transformers import AutoTokenizer
 from datasets import load_dataset, get_dataset_config_names
 import warnings
 warnings.filterwarnings("ignore")
 
-FLORES_REPO = "openlanguagedata/flores_plus"
+BI_REPO    = "catherinearnett/bilingual_tokenizers2"
+MONO_REPO  = "catherinearnett/monolingual_tokenizers"
+FLORES_REPO   = "openlanguagedata/flores_plus"
 FLORES_SPLITS = ["dev", "devtest"]
-TEXT_COLUMN = "sentence"
+TEXT_COLUMN   = "sentence"
+
+OUT_COLS = ["tokenizer", "kind", "lang1", "lang2", "proportion",
+            "tok_type", "whitespace", "vocab_size", "flores_lang", "ctc"]
 
 
 # ── filename parsing ──────────────────────────────────────────────────────────
@@ -51,7 +56,6 @@ def parse_stem(stem):
     if len(parts) == 5 and parts[2] in ("bpe", "unigram"):
         return {
             "kind":       "mono",
-            "lang":       "_".join(parts[0:2]),
             "lang1":      "_".join(parts[0:2]),
             "lang2":      None,
             "proportion": None,
@@ -62,7 +66,6 @@ def parse_stem(stem):
     if len(parts) == 9 and parts[4] in {"10", "25", "50", "75", "90"}:
         return {
             "kind":       "bi",
-            "lang":       None,
             "lang1":      "_".join(parts[0:2]),
             "lang2":      "_".join(parts[2:4]),
             "proportion": "_".join(parts[4:6]),
@@ -73,38 +76,64 @@ def parse_stem(stem):
     return None
 
 
+# ── HF repo helpers ───────────────────────────────────────────────────────────
+
+def get_repo_stems(api, repo_id, token):
+    """
+    List all tokenizer stems in a repo (each is a top-level subdirectory).
+    Uses non-recursive listing to avoid HF pagination 500 errors.
+    """
+    stems = []
+    try:
+        for item in api.list_repo_tree(
+            repo_id=repo_id,
+            repo_type="dataset",
+            path_in_repo="",
+            recursive=False,
+            token=token,
+        ):
+            # RepoFolder: has 'path', no 'rfilename'
+            if not hasattr(item, "rfilename") and hasattr(item, "path"):
+                stems.append(item.path)
+    except Exception as e:
+        print(f"  WARNING fetching stems from {repo_id}: {e}")
+    return stems
+
+
 # ── FLORES helpers ────────────────────────────────────────────────────────────
 
 def get_flores_configs(token):
-    """Fetch all available language configs from FLORES+."""
     try:
-        configs = get_dataset_config_names(FLORES_REPO, token=token)
-        return set(configs)
+        return set(get_dataset_config_names(FLORES_REPO, token=token))
     except Exception as e:
         print(f"WARNING: could not fetch FLORES+ config list: {e}")
         return set()
 
 
+# Cache sentences in memory within a process to avoid re-downloading
+_flores_cache = {}
+
 def load_flores_sentences(lang, token, flores_configs):
-    """
-    Load all sentences for a language from FLORES+ (dev + devtest).
-    Returns list of strings, or None if lang not available.
-    """
     if lang not in flores_configs:
         return None
+    if lang in _flores_cache:
+        return _flores_cache[lang]
     sentences = []
     for split in FLORES_SPLITS:
         try:
-            ds = load_dataset(FLORES_REPO, lang, split=split, token=token,
-                              trust_remote_code=False)
+            ds = load_dataset(FLORES_REPO, lang, split=split,
+                              token=token, trust_remote_code=False)
             sentences.extend(ds[TEXT_COLUMN])
         except Exception as e:
             print(f"  WARNING: could not load {lang}/{split}: {e}")
-    return sentences if sentences else None
+    result = sentences if sentences else None
+    _flores_cache[lang] = result
+    return result
 
+
+# ── CTC ───────────────────────────────────────────────────────────────────────
 
 def compute_ctc(sentences, tokenizer):
-    """Sum of non-special tokens across all sentences."""
     special_ids = set(tokenizer.all_special_ids)
     total = 0
     for sent in sentences:
@@ -113,34 +142,22 @@ def compute_ctc(sentences, tokenizer):
     return total
 
 
-# ── per-tokenizer worker ──────────────────────────────────────────────────────
-
-def process_tokenizer(json_path, flores_configs, token, all_flores_langs):
-    """
-    Compute CTC for one tokenizer file.
-    Returns list of result dicts (one per flores_lang evaluated).
-    """
-    stem = os.path.splitext(os.path.basename(json_path))[0]
-    info = parse_stem(stem)
-    if info is None:
-        return [], f"SKIP (unparseable): {stem}"
-
+def process_one(stem, repo_id, info, flores_configs, token, all_flores_langs):
+    """Load tokenizer from HF and compute CTC for all target languages."""
     try:
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=json_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            f"{repo_id}/{stem}", token=token, trust_remote_code=False
+        )
     except Exception as e:
         return [], f"ERROR loading tokenizer {stem}: {e}"
 
-    # Determine which FLORES languages to evaluate
-    if info["kind"] == "bi":
-        target_langs = [info["lang1"], info["lang2"]]
-    else:
-        # monolingual: all FLORES languages
-        target_langs = sorted(all_flores_langs)
+    target_langs = (
+        [info["lang1"], info["lang2"]] if info["kind"] == "bi"
+        else sorted(all_flores_langs)
+    )
 
     rows = []
     for flores_lang in target_langs:
-        if flores_lang not in flores_configs:
-            continue
         sentences = load_flores_sentences(flores_lang, token, flores_configs)
         if sentences is None:
             continue
@@ -148,7 +165,6 @@ def process_tokenizer(json_path, flores_configs, token, all_flores_langs):
             ctc = compute_ctc(sentences, tokenizer)
         except Exception as e:
             ctc = None
-
         rows.append({
             "tokenizer":   stem,
             "kind":        info["kind"],
@@ -169,77 +185,85 @@ def process_tokenizer(json_path, flores_configs, token, all_flores_langs):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_dir",  default="hf_tokenizers",
-                        help="Directory of .json HF fast tokenizer files")
-    parser.add_argument("--out",     default="ctc_results.csv",
-                        help="Output CSV path")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Parallel workers (keep low — each loads from HF)")
-    parser.add_argument("--resume",  action="store_true",
-                        help="Skip tokenizers already present in output CSV")
+    parser.add_argument("--out",    default="ctc_results.csv")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip tokenizers already in output CSV")
     args = parser.parse_args()
 
     token = os.environ.get("HF_TOKEN_READ")
     if not token:
-        raise EnvironmentError("HF_TOKEN_READ environment variable not set.")
+        sys.exit("ERROR: set HF_TOKEN_READ environment variable")
 
-    # ── discover tokenizer files ──────────────────────────────────────────────
-    json_files = sorted(glob.glob(os.path.join(args.hf_dir, "*.json")))
-    print(f"Found {len(json_files)} tokenizer .json files in {args.hf_dir}/")
+    api = HfApi()
 
+    # ── collect stems from both repos ─────────────────────────────────────────
+    print(f"Fetching tokenizer list from HF repos...")
+    bi_stems   = get_repo_stems(api, BI_REPO,   token)
+    mono_stems = get_repo_stems(api, MONO_REPO, token)
+    print(f"  {BI_REPO}:   {len(bi_stems)} tokenizers")
+    print(f"  {MONO_REPO}: {len(mono_stems)} tokenizers")
+
+    # Build unified job list: (stem, repo_id, info)
+    jobs = []
+    for stem in bi_stems:
+        info = parse_stem(stem)
+        if info:
+            jobs.append((stem, BI_REPO, info))
+        else:
+            print(f"  SKIP (unparseable): {stem}")
+    for stem in mono_stems:
+        info = parse_stem(stem)
+        if info:
+            jobs.append((stem, MONO_REPO, info))
+        else:
+            print(f"  SKIP (unparseable): {stem}")
+
+    print(f"  Total jobs: {len(jobs)}\n")
+
+    # ── resume: skip already-done tokenizers ──────────────────────────────────
     if args.resume and os.path.exists(args.out):
         done = set(pd.read_csv(args.out)["tokenizer"].unique())
-        json_files = [f for f in json_files
-                      if os.path.splitext(os.path.basename(f))[0] not in done]
-        print(f"  Resuming: {len(json_files)} tokenizers remaining")
+        before = len(jobs)
+        jobs = [(s, r, i) for s, r, i in jobs if s not in done]
+        print(f"Resuming: skipped {before - len(jobs)} done, {len(jobs)} remaining\n")
 
-    # ── fetch available FLORES+ configs ──────────────────────────────────────
-    print(f"\nFetching available FLORES+ language configs...")
+    # ── fetch FLORES+ configs ─────────────────────────────────────────────────
+    print("Fetching FLORES+ language configs...")
     flores_configs = get_flores_configs(token)
-    print(f"  {len(flores_configs)} language configs available\n")
+    print(f"  {len(flores_configs)} configs available\n")
+    all_flores_langs = flores_configs
 
-    # Languages used by bilingual tokenizers (for mono → evaluate all of these)
-    # We evaluate mono tokenizers on all FLORES+ configs found.
-    all_flores_langs = flores_configs  # full set
-
-    # ── write CSV header if needed ────────────────────────────────────────────
-    out_cols = ["tokenizer", "kind", "lang1", "lang2", "proportion",
-                "tok_type", "whitespace", "vocab_size", "flores_lang", "ctc"]
+    # ── write CSV header ──────────────────────────────────────────────────────
     if not (args.resume and os.path.exists(args.out)):
-        pd.DataFrame(columns=out_cols).to_csv(args.out, index=False)
+        pd.DataFrame(columns=OUT_COLS).to_csv(args.out, index=False)
 
-    # ── process tokenizers ────────────────────────────────────────────────────
-    # NOTE: we use a modest worker count because each worker downloads from HF.
-    # For monolingual tokenizers (many FLORES langs), consider --workers 1-2
-    # and let the HF datasets cache do the heavy lifting.
-    total = len(json_files)
-    done_count = 0
-    error_count = 0
+    # ── process sequentially ──────────────────────────────────────────────────
+    # Sequential is intentional: FLORES cache is per-process and HF datasets
+    # caches to disk. Parallel workers can't share the in-memory cache and
+    # may hit rate limits. Monolingual tokenizers re-use cached FLORES data
+    # for each new tokenizer, so the bottleneck quickly becomes tokenization
+    # rather than downloads.
+    total = len(jobs)
+    done_count = err_count = 0
 
-    # Sequential processing is safer here because datasets caches per-process
-    # and parallel HF requests can hit rate limits. Use workers for bilingual
-    # (only 2 langs each) but be careful with monolingual (200+ langs each).
-    for i, json_path in enumerate(json_files, 1):
-        stem = os.path.splitext(os.path.basename(json_path))[0]
-        info = parse_stem(stem)
-        kind = info["kind"] if info else "?"
-        print(f"[{i}/{total}] {stem}  ({kind})")
+    for i, (stem, repo_id, info) in enumerate(jobs, 1):
+        print(f"[{i}/{total}] {stem}  ({info['kind']})")
 
-        rows, err = process_tokenizer(json_path, flores_configs, token, all_flores_langs)
+        rows, err = process_one(
+            stem, repo_id, info, flores_configs, token, all_flores_langs
+        )
 
         if err:
             print(f"  {err}")
-            error_count += 1
+            err_count += 1
         else:
             if rows:
                 pd.DataFrame(rows).to_csv(args.out, mode="a", header=False, index=False)
             done_count += 1
             print(f"  → {len(rows)} CTC values written")
 
-    print(f"\nDone. Processed: {done_count}  Errors: {error_count}")
-    print(f"Results written to {args.out}")
-    total_rows = pd.read_csv(args.out).shape[0]
-    print(f"Total rows in CSV: {total_rows}")
+    print(f"\nDone. Processed: {done_count}  Errors: {err_count}")
+    print(f"Results: {args.out}  ({pd.read_csv(args.out).shape[0]} rows)")
 
 
 if __name__ == "__main__":
