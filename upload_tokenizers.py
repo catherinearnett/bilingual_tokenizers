@@ -66,62 +66,143 @@ def parse_stem(stem):
 
 # ── conversion ────────────────────────────────────────────────────────────────
 
+def _spm_bpe_to_hf(model_path):
+    """
+    Convert a BPE SentencePiece model to a HF Tokenizer object without using
+    SpmConverter (which is broken for BPE in multiple transformers versions).
+
+    Uses sentencepiece directly to extract vocab and merges, then builds a
+    tokenizers.models.BPE model from scratch.
+
+    SPM BPE vocab structure:
+      - Special tokens first: <pad>(0) <unk>(1) <s>(2) </s>(3)
+      - Byte tokens: <0x00>..<0xFF>  (score=0)
+      - Subword pieces in merge order (score = negative merge priority)
+
+    Merges are extracted by finding, for each multi-char piece, the split into
+    two known pieces that has the highest combined score (i.e. was learned first).
+    """
+    import sentencepiece as spm_lib
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers import AddedToken
+
+    sp = spm_lib.SentencePieceProcessor()
+    sp.Load(model_path)
+    n = sp.get_piece_size()
+
+    # Build vocab: piece → id
+    vocab = {sp.id_to_piece(i): i for i in range(n)}
+
+    # Identify which pieces are "atomic" (special tokens or byte tokens)
+    # These cannot be further split and are not merge products.
+    # Byte tokens look like <0xNN>
+    import re
+    byte_re = re.compile(r'^<0x[0-9A-Fa-f]{2}>$')
+    special_ids = {sp.id_to_piece(i) for i in range(n)
+                   if sp.IsControl(i) or sp.IsUnknown(i) or sp.IsByte(i)}
+
+    # Extract merges: for each non-atomic piece, find the best split
+    # into (left, right) where both left and right are in vocab.
+    # "Best" = the split where min(rank(left), rank(right)) is maximised
+    # (i.e. both parts were learned as early as possible).
+    merges = []
+    for i in range(n):
+        piece = sp.id_to_piece(i)
+        if piece in special_ids or len(piece) <= 1:
+            continue
+        # Try all split positions, pick the one where the later-learned part
+        # is as early as possible (greedy left-to-right, matching SPM BPE)
+        best = None
+        best_max_id = n + 1
+        for pos in range(1, len(piece)):
+            left, right = piece[:pos], piece[pos:]
+            if left in vocab and right in vocab:
+                max_id = max(vocab[left], vocab[right])
+                if max_id < best_max_id:
+                    best_max_id = max_id
+                    best = (left, right)
+        if best:
+            merges.append(best)
+
+    # Build the HF BPE tokenizer
+    # Special tokens need to be added explicitly
+    special_tokens = [
+        AddedToken("<pad>", special=True),
+        AddedToken("<unk>", special=True),
+        AddedToken("<s>",   special=True),
+        AddedToken("</s>",  special=True),
+    ]
+
+    tokenizer = Tokenizer(BPE(
+        vocab=vocab,
+        merges=merges,
+        unk_token="<unk>",
+        fuse_unk=True,
+        byte_fallback=True,
+    ))
+    tokenizer.add_special_tokens(special_tokens)
+    return tokenizer
+
+
 def convert_spm(model_path, tok_type, out_dir):
     """
     Convert one SPM .model → HF tokenizer saved in out_dir/.
-    Exactly matches the reference code that was tested and confirmed working.
     tok_type: "bpe" or "unigram"
-    """
-    from tokenizers.normalizers import Prepend, Sequence as NormSequence
 
+    BPE:    Uses _spm_bpe_to_hf() — builds directly from sentencepiece vocab/merges.
+            Avoids SpmConverter which is broken for BPE across multiple transformers
+            versions.
+    Unigram: Uses LlamaTokenizer → SpmConverter (stable, matches reference code).
+             byte_fallback patched into tokenizer.json after saving.
+    """
     os.makedirs(out_dir, exist_ok=True)
 
-    slow_tokenizer = LlamaTokenizer(vocab_file=model_path)
-    converter = SpmConverter(slow_tokenizer)
-    converted = converter.converted()
-
-    hf_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=converted,
-        unk_token="<unk>",
-        pad_token="<pad>",
-        bos_token="<s>",
-        eos_token="</s>",
-        add_bos_token=True,
-        add_eos_token=False,
-    )
-
     if tok_type == "bpe":
-        # Exactly as in reference code — Sequence([Prepend, Replace]) is set
-        # then immediately overwritten by the plain Replace (matches original)
-        hf_tokenizer.backend_tokenizer.normalizer = NormSequence([
-            Prepend("▁"),
-            NormalizerReplace(" ", "▁"),
-        ])
-        hf_tokenizer.backend_tokenizer.pre_tokenizer = None
-        hf_tokenizer.backend_tokenizer.normalizer = NormalizerReplace(" ", "▁")
-        hf_tokenizer.backend_tokenizer.decoder = DecoderSequence([
-            ByteFallback(),
-            Metaspace(replacement="▁", prepend_scheme="never", split=False),
-        ])
-        hf_tokenizer.backend_tokenizer.model.byte_fallback = True
-        hf_tokenizer.save_pretrained(out_dir)
+        tokenizer_obj = _spm_bpe_to_hf(model_path)
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_obj,
+            unk_token="<unk>",
+            pad_token="<pad>",
+            bos_token="<s>",
+            eos_token="</s>",
+            add_bos_token=True,
+            add_eos_token=False,
+        )
     else:
-        # unigram: same normalizer/decoder, byte_fallback patched into JSON
-        hf_tokenizer.backend_tokenizer.normalizer = NormalizerReplace(" ", "▁")
-        hf_tokenizer.backend_tokenizer.pre_tokenizer = None
-        hf_tokenizer.backend_tokenizer.decoder = DecoderSequence([
-            ByteFallback(),
-            Metaspace(replacement="▁", prepend_scheme="never", split=False),
-        ])
-        hf_tokenizer.save_pretrained(out_dir)
-        tok_json_path = os.path.join(out_dir, "tokenizer.json")
-        with open(tok_json_path) as f:
-            tok_data = json.load(f)
-        tok_data["model"]["byte_fallback"] = True
-        with open(tok_json_path, "w") as f:
-            json.dump(tok_data, f, ensure_ascii=False, indent=2)
+        slow_tokenizer = LlamaTokenizer(vocab_file=model_path)
+        converter = SpmConverter(slow_tokenizer)
+        converted = converter.converted()
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=converted,
+            unk_token="<unk>",
+            pad_token="<pad>",
+            bos_token="<s>",
+            eos_token="</s>",
+            add_bos_token=True,
+            add_eos_token=False,
+        )
 
-    return os.path.join(out_dir, "tokenizer.json")
+    # Same normalizer + decoder for all four variants
+    hf_tokenizer.backend_tokenizer.normalizer    = NormalizerReplace(" ", "▁")
+    hf_tokenizer.backend_tokenizer.pre_tokenizer = None
+    hf_tokenizer.backend_tokenizer.decoder = DecoderSequence([
+        ByteFallback(),
+        Metaspace(replacement="▁", prepend_scheme="never", split=False),
+    ])
+
+    # Save then patch byte_fallback into JSON for both types
+    # (BPE model.byte_fallback=True is already set via BPE() constructor above,
+    #  but the JSON patch ensures it survives save/reload for both types)
+    hf_tokenizer.save_pretrained(out_dir)
+    tok_json_path = os.path.join(out_dir, "tokenizer.json")
+    with open(tok_json_path) as f:
+        tok_data = json.load(f)
+    tok_data["model"]["byte_fallback"] = True
+    with open(tok_json_path, "w") as f:
+        json.dump(tok_data, f, ensure_ascii=False, indent=2)
+
+    return tok_json_path
 
 def convert_one(args):
     """Worker: convert one SPM model. Returns (stem, tok_json_path_or_None, error_or_None)."""
