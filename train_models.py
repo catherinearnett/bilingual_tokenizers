@@ -196,7 +196,7 @@ for _, row in df.iterrows():
 
 # write master script
 all_scripts = sorted(f for f in os.listdir(SCRIPTS_DIR) if f.startswith('train_'))
-master_path = so path join(SCRIPTS_DIR, 'run_all.sh')
+master_path = os.path.join(SCRIPTS_DIR, 'run_all.sh')
 with open(master_path, 'w') as f:
     f.write('#!/bin/bash\n')
     for s in all_scripts:
