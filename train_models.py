@@ -116,7 +116,7 @@ python3 {WALM_DIR}/lm_code/run_transformer_language_modeling.py \\
 --per_device_train_batch_size={batch_per_device} \\
 --gradient_accumulation_steps={grad_accum} \\
 --per_device_eval_batch_size=8 \\
---evaluation_strategy=steps --save_strategy=steps \\
+--eval_strategy=steps --save_strategy=steps \\
 --eval_steps={eval_steps} --save_steps={save_steps} \\
 --max_steps={max_steps} \\
 --warmup_steps={warmup_steps} \\
