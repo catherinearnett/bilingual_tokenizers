@@ -24,15 +24,15 @@ import shutil
 
 # ── config ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
-GOLDFISH_DIR   = os.path.join(SCRIPT_DIR, 'goldfish')
-WALM_DIR       = os.path.join(GOLDFISH_DIR, 'word-acquisition-language-models')
+GOLDFISH_DIR = os.path.join(SCRIPT_DIR, 'goldfish')
+WALM_DIR     = os.path.join(GOLDFISH_DIR, 'word-acquisition-language-models')
 TRAINING_DATA  = os.path.join(SCRIPT_DIR, 'custom_training_data')
 TOKENIZERS_DIR = os.path.join(SCRIPT_DIR, 'custom_tokenizers')
 TOKENIZED_DIR  = os.path.join(SCRIPT_DIR, 'custom_tokenized_data')
 MODELS_DIR     = os.path.join(SCRIPT_DIR, 'custom_models')
 SCRIPTS_DIR    = os.path.join(SCRIPT_DIR, 'custom_training_scripts')
 HF_REPO        = 'catherinearnett/bilingual_tokenizers2'
-CONFIG_PATH    = os.path.join(GOLDFISH_DIR, 'gpt_base_config.json')
+CONFIG_PATH  = os.path.join(GOLDFISH_DIR, 'training_code', 'gpt_base_config.json')
 
 # Goldfish hyperparameters (1000mb scale)
 WARMUP_PROPORTION = 0.10
