@@ -24,15 +24,15 @@ import shutil
 
 # ── config ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
-GOLDFISH_DIR = os.path.join(SCRIPT_DIR, 'goldfish')
-WALM_DIR     = os.path.join(GOLDFISH_DIR, 'word-acquisition-language-models')
+GOLDFISH_DIR   = os.path.join(SCRIPT_DIR, 'goldfish')
+WALM_DIR       = os.path.join(GOLDFISH_DIR, 'word-acquisition-language-models')
 TRAINING_DATA  = os.path.join(SCRIPT_DIR, 'custom_training_data')
 TOKENIZERS_DIR = os.path.join(SCRIPT_DIR, 'custom_tokenizers')
 TOKENIZED_DIR  = os.path.join(SCRIPT_DIR, 'custom_tokenized_data')
 MODELS_DIR     = os.path.join(SCRIPT_DIR, 'custom_models')
 SCRIPTS_DIR    = os.path.join(SCRIPT_DIR, 'custom_training_scripts')
 HF_REPO        = 'catherinearnett/bilingual_tokenizers2'
-CONFIG_PATH  = os.path.join(GOLDFISH_DIR, 'training_code', 'gpt_base_config.json')
+CONFIG_PATH    = os.path.join(GOLDFISH_DIR, 'training_code', 'gpt_base_config.json')
 
 # Goldfish hyperparameters (1000mb scale)
 WARMUP_PROPORTION = 0.10
@@ -97,7 +97,6 @@ def write_training_script(stem, tokenizer_dir, tokenized_train, n_examples, mode
     epoch_steps  = n_examples / BATCH_SIZE
     max_steps    = int(EPOCHS * epoch_steps)
     warmup_steps = int(max_steps * WARMUP_PROPORTION)
-    eval_steps   = int(epoch_steps / 2)
     save_steps   = int(epoch_steps / 2)
 
     model_bin = os.path.join(model_outdir, 'pytorch_model.bin')
@@ -112,12 +111,11 @@ fi
 python3 {WALM_DIR}/lm_code/run_transformer_language_modeling.py \\
 --tokenizer_name={tokenizer_dir} \\
 --config_name={CONFIG_PATH} \\
---do_train --train_iterable --eval_iterable \\
+--do_train --train_iterable \\
 --per_device_train_batch_size={batch_per_device} \\
 --gradient_accumulation_steps={grad_accum} \\
---per_device_eval_batch_size=8 \\
---eval_strategy=steps --save_strategy=steps \\
---eval_steps={eval_steps} --save_steps={save_steps} \\
+--eval_strategy=no --save_strategy=steps \\
+--save_steps={save_steps} \\
 --max_steps={max_steps} \\
 --warmup_steps={warmup_steps} \\
 --learning_rate={LEARNING_RATE} --adam_epsilon=1e-6 --weight_decay=0.01 \\
@@ -158,11 +156,11 @@ for _, row in df.iterrows():
         ('custom', p1,  p2),
         ('50_50',  50,  50),
     ]:
-        stem          = f'{lang1}_{lang2}_{p1_tok}_{p2_tok}_{tok_type}_{whitespace}_{vocab_size}'
-        hf_path       = f'custom_mix/{stem}' if mix == 'custom' else stem
-        tokenizer_dir = os.path.join(TOKENIZERS_DIR, stem)
+        stem           = f'{lang1}_{lang2}_{p1_tok}_{p2_tok}_{tok_type}_{whitespace}_{vocab_size}'
+        hf_path        = f'custom_mix/{stem}' if mix == 'custom' else stem
+        tokenizer_dir  = os.path.join(TOKENIZERS_DIR, stem)
         tokenized_file = os.path.join(TOKENIZED_DIR, f'{stem}.txt')
-        model_outdir  = os.path.join(MODELS_DIR, stem)
+        model_outdir   = os.path.join(MODELS_DIR, stem)
 
         print(f'\n[{mix}] {stem}')
 
