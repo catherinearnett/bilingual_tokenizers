@@ -41,6 +41,7 @@ LEARNING_RATE     = 0.0001
 BATCH_SIZE        = 64
 MAX_BATCH_PER_DEV = 8
 TOKENS_PER_SEQ    = 512
+N_GPUS            = 6   # GPUs 0-5
 
 for d in [TOKENIZERS_DIR, TOKENIZED_DIR, MODELS_DIR, SCRIPTS_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -89,7 +90,7 @@ def count_tokens(tokenized_file):
         return sum(1 for _ in f)
 
 
-def write_training_script(stem, tokenizer_dir, tokenized_train, n_examples, model_outdir):
+def write_training_script(stem, tokenizer_dir, tokenized_train, n_examples, model_outdir, gpu_id=0):
     """Write a goldfish-style bash training script with steps scaled to full data."""
     batch_per_device = min(BATCH_SIZE, MAX_BATCH_PER_DEV)
     grad_accum       = BATCH_SIZE // batch_per_device
@@ -102,7 +103,7 @@ def write_training_script(stem, tokenizer_dir, tokenized_train, n_examples, mode
     model_bin = os.path.join(model_outdir, 'pytorch_model.bin')
 
     script = f"""#!/bin/bash
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES={gpu_id}
 
 # {stem}
 if test -f {model_bin}; then
@@ -140,6 +141,7 @@ fi
 df = pd.read_csv('extreme_pairs_with_crossing.csv').dropna(subset=['crossing_proportion'])
 
 processed_tokenizations = set()
+all_stems = []  # track order for GPU assignment
 
 for _, row in df.iterrows():
     lang1      = row['lang1']
@@ -188,20 +190,29 @@ for _, row in df.iterrows():
         n_examples = count_tokens(tokenized_file)
         print(f'  n_examples: {n_examples}')
 
-        # 4. write training script
+        # 4. write training script (gpu assigned later)
         os.makedirs(model_outdir, exist_ok=True)
         script_path = write_training_script(
-            stem, tokenizer_dir, tokenized_file, n_examples, model_outdir
+            stem, tokenizer_dir, tokenized_file, n_examples, model_outdir,
+            gpu_id=len(all_stems) % N_GPUS
         )
+        all_stems.append(stem)
         print(f'  Script written: {script_path}')
 
-# write master script
+# ── write master script running N_GPUS models in parallel ────────────────────
 all_scripts = sorted(f for f in os.listdir(SCRIPTS_DIR) if f.startswith('train_'))
 master_path = os.path.join(SCRIPTS_DIR, 'run_all.sh')
+
 with open(master_path, 'w') as f:
-    f.write('#!/bin/bash\n')
-    for s in all_scripts:
-        f.write(f'bash {os.path.join(SCRIPTS_DIR, s)}\n')
+    f.write('#!/bin/bash\n\n')
+    for i, s in enumerate(all_scripts):
+        script_full = os.path.join(SCRIPTS_DIR, s)
+        f.write(f'bash {script_full} &\n')
+        if (i + 1) % N_GPUS == 0:
+            f.write('wait\n\n')
+    f.write('wait\n')
+
 os.chmod(master_path, 0o755)
 
-print(f'\nDone. Run all with:\n  bash {master_path}')
+print(f'\nDone. {len(all_scripts)} scripts written.')
+print(f'Run all ({N_GPUS} at a time) with:\n  bash {master_path}')
