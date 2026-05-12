@@ -120,6 +120,7 @@ python3 {WALM_DIR}/lm_code/run_transformer_language_modeling.py \\
 --warmup_steps={warmup_steps} \\
 --learning_rate={LEARNING_RATE} --adam_epsilon=1e-6 --weight_decay=0.01 \\
 --train_data_file={tokenized_train} \\
+--overwrite_output_dir \\
 --seed=43 \\
 --override_n_examples={n_examples} \\
 --output_dir={model_outdir}
