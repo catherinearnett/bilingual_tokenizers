@@ -107,7 +107,9 @@ export CUDA_VISIBLE_DEVICES=0
 # {stem}
 if test -f {model_bin}; then
 echo "Model already found: {stem}."
-fi
+else
+rm -rf {model_outdir}
+mkdir -p {model_outdir}
 python3 {WALM_DIR}/lm_code/run_transformer_language_modeling.py \\
 --tokenizer_name={tokenizer_dir} \\
 --config_name={CONFIG_PATH} \\
@@ -120,11 +122,11 @@ python3 {WALM_DIR}/lm_code/run_transformer_language_modeling.py \\
 --warmup_steps={warmup_steps} \\
 --learning_rate={LEARNING_RATE} --adam_epsilon=1e-6 --weight_decay=0.01 \\
 --train_data_file={tokenized_train} \\
---overwrite_output_dir \\
 --seed=43 \\
 --override_n_examples={n_examples} \\
 --output_dir={model_outdir}
 cp {tokenizer_dir}/* {model_outdir}
+fi
 """
     script_path = os.path.join(SCRIPTS_DIR, f'train_{stem}.sh')
     with codecs.open(script_path, 'w', encoding='utf-8') as f:
