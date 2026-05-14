@@ -85,7 +85,6 @@ def upload_main(api, model_dir: Path, repo_id: str):
             revision="main",
             token=get_token(),
             commit_message="Add main model files",
-            repo_type="model"
         )
     print("  ✓ Main model files uploaded.")
 
@@ -113,7 +112,6 @@ def upload_checkpoint(api, checkpoint_dir: Path, repo_id: str):
         revision=branch,
         token=get_token(),
         commit_message=f"Add {branch}",
-        repo_type="model"
     )
     print(f"  ✓ {branch} uploaded.")
 
